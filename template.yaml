@@ -1,3 +1,240 @@
-AWSTemplateFormatVersion: '2010-09-09'
-Transform: 'AWS::Serverless-2016-10-31'
-Resources: {}
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Resources:
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub
+        - ${ResourceName} From Stack ${StackTagName} Environment ${EnvironmentTagName}
+        - ResourceName: Api
+      StageName: !Ref EnvironmentAPIGatewayStageName
+      DefinitionBody:
+        swagger: '2.0'
+        info: {}
+        x-amazon-apigateway-request-validators:
+          Validate body:
+            validateRequestParameters: false
+            validateRequestBody: true
+        x-amazon-apigateway-gateway-responses:
+          BAD_REQUEST_BODY:
+            statusCode: 400
+            responseTemplates:
+              application/json: |-
+                {
+                  "message": "$context.error.validationErrorString"
+                }
+        definitions:
+          PutRecord:
+            type: object
+          SendEmail:
+            type: object
+            properties:
+              to:
+                type: string
+              subject:
+                type: string
+              body:
+                type: string
+            required:
+              - body
+              - subject
+              - to
+            additionalProperties: false
+        paths:
+          /records/{id}:
+            get:
+              x-amazon-apigateway-integration:
+                type: aws
+                credentials: !GetAtt TableAccessRole.Arn
+                httpMethod: POST
+                uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:dynamodb:action/GetItem
+                requestTemplates:
+                  application/json: !Sub |-
+                    {
+                      "TableName": "${Table}",
+                      "Key": {
+                        "id": {
+                          "S": "$input.params('id')"
+                        }
+                      }
+                    }
+                responses:
+                  200:
+                    statusCode: "200"
+                    responseTemplates:
+                      application/json: |-
+                        {#foreach ($entry in $input.path('$.Item').entrySet())
+                        #if ($entry.key == 'id')#elseif ($entry.value.containsKey('N'))
+
+                          "$entry.key": $entry.value.N#if ($foreach.hasNext),#end#elseif ($entry.value.containsKey('BOOL'))
+                          
+                          "$entry.key": $entry.value.BOOL#if ($foreach.hasNext),#end#elseif ($entry.value.containsKey('NULL'))
+                          
+                          "$entry.key": null#if ($foreach.hasNext),#end#else
+                          
+                          "$entry.key": #foreach ($attributeEntry in $entry.value.entrySet())"$attributeEntry.value"#end#if ($foreach.hasNext),#end
+                        #end#end
+
+                        }
+              responses:
+                200:
+                  description: 200 response
+            put:
+              consumes:
+                - application/json
+              parameters:
+                - in: body
+                  name: PutRecord
+                  required: true
+                  schema:
+                    $ref: "#/definitions/PutRecord"
+              x-amazon-apigateway-request-validator: Validate body
+              x-amazon-apigateway-integration:
+                type: aws
+                credentials: !GetAtt TableAccessRole.Arn
+                httpMethod: POST
+                uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:dynamodb:action/PutItem
+                requestTemplates:
+                  application/json: !Sub |-
+                    {
+                      "TableName": "${Table}",
+                      "Item": {
+                        "id": {
+                          "S": "$input.params('id')"
+                        }
+                    #foreach ($entry in $input.path('$').entrySet())
+                        ,
+                        "$entry.key": {
+                      #if ($entry.value.class.name == 'java.lang.Integer' || $entry.value.class.name == 'java.lang.Double')
+                          "N": "$entry.value"
+                      #elseif ($entry.value.class.name == 'java.lang.Boolean')
+                          "BOOL": $entry.value
+                      #elseif ($entry.value.class.name == 'java.lang.String')
+                          "S": "$entry.value"
+                      #elseif ($entry.value.class.name == '')
+                          "NULL": true
+                      #else
+                          "S": "$entry.value"
+                      #end
+                        }
+                    #end
+                      }
+                    }
+                responses:
+                  200:
+                    statusCode: "200"
+              responses:
+                200:
+                  description: 200 response
+            delete:
+              x-amazon-apigateway-integration:
+                type: aws
+                credentials: !GetAtt TableAccessRole.Arn
+                httpMethod: POST
+                uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:dynamodb:action/DeleteItem
+                requestTemplates:
+                  application/json: !Sub |-
+                    {
+                      "TableName": "${Table}",
+                      "Key": {
+                        "id": {
+                          "S": "$input.params('id')"
+                        }
+                      }
+                    }
+                responses:
+                  200:
+                    statusCode: "200"
+              responses:
+                200:
+                  description: 200 response
+          /email:
+            post:
+              consumes:
+                - application/json
+              parameters:
+                - in: body
+                  name: SendEmail
+                  required: true
+                  schema:
+                    $ref: "#/definitions/SendEmail"
+              x-amazon-apigateway-request-validator: Validate body
+              x-amazon-apigateway-integration:
+                type: aws
+                credentials: !GetAtt SendEmailRole.Arn
+                httpMethod: POST
+                uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:email:path//
+                requestParameters:
+                  integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+                requestTemplates:
+                  application/json: Action=SendEmail&Source=$util.urlEncode('demo@stackery.io')&Destination.ToAddresses.member.1=$util.urlEncode($input.path('$.to'))&Message.Subject.Data=$util.urlEncode($input.path('$.subject'))&Message.Body.Text.Data=$util.urlEncode($input.path('$.body'))
+                responses:
+                  200:
+                    statusCode: "200"
+              responses:
+                200:
+                  description: 200 response
+      EndpointConfiguration: REGIONAL
+      TracingEnabled: true
+  Table:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      TableName: !Sub ${AWS::StackName}-Table
+  TableAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBCrudPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt Table.Arn
+  SendEmailRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SESSendPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: ses:SendEmail
+                Resource: !Sub arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*@stackery.io
+Parameters:
+  StackTagName:
+    Type: String
+    Description: Stack Name (injected by Stackery at deployment time)
+  EnvironmentTagName:
+    Type: String
+    Description: Environment Name (injected by Stackery at deployment time)
+  EnvironmentAPIGatewayStageName:
+    Type: String
+    Description: Environment name used for API Gateway Stage names (injected by Stackery at deployment time)
